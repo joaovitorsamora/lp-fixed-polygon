@@ -1,0 +1,41 @@
+{
+  "_format": "hh-sol-cache-2",
+  "files": {
+    "E:\\Usuario\\Documents\\lp-manager-fixed (1)\\lp-fixed\\lp-keeper\\contracts\\LPKeeper.sol": {
+      "lastModificationDate": 1776517675046,
+      "contentHash": "bd95b4712ec0b9acfc29453198e14b2e",
+      "sourceName": "contracts/LPKeeper.sol",
+      "solcConfig": {
+        "version": "0.8.24",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "evmVersion": "paris",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "LPKeeper"
+      ]
+    }
+  }
+}

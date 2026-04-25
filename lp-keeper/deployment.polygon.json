@@ -1,0 +1,20 @@
+{
+  "network": "Polygon Mainnet",
+  "chainId": 137,
+  "address": "0xde95b32d6B0ff10C5Bcec9e13F41aCA94D352e67",
+  "deployedAt": "2026-04-25T21:03:10.259Z",
+  "deployer": "0x557CF908A134290817faAd5657Ab3Ec665D88605",
+  "keeper": "0x557CF908A134290817faAd5657Ab3Ec665D88605",
+  "initialFunds": {
+    "wpolWei": "49114314462676055939",
+    "usdcRaw": "0",
+    "polPriceUSD": 0.094,
+    "totalUSD": 4.616745559491549
+  },
+  "position": {
+    "tickLower": 299450,
+    "tickUpper": 300460,
+    "lowerPriceUSD": 0.09894736842105263,
+    "upperPriceUSD": 0.08952380952380952
+  }
+}
