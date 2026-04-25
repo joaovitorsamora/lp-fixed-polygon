@@ -43,6 +43,8 @@ const UNIV3_POOL_ABI = [
   "function liquidity() external view returns (uint128)",
 ];
 
+// ── On-Chain Provider corrigido ──────────────────────
+
 export class OnChainProvider {
   private provider: ethers.JsonRpcProvider;
 
@@ -52,8 +54,8 @@ export class OnChainProvider {
 
   async fetchCurrentPoolData(
     poolAddress: string,
-    token0Decimals = 6,   // USDC = 6
-    token1Decimals = 18   // ARB/ETH/etc = 18
+    token0Decimals = 18,   // WPOL = 18 (Geralmente token0 na Polygon para este par)
+    token1Decimals = 6     // USDC = 6 (Geralmente token1)
   ): Promise<{ price: number; liquidity: string }> {
     const safeAddress = getAddress(poolAddress);
     const contract = new ethers.Contract(safeAddress, UNIV3_POOL_ABI, this.provider);
@@ -64,11 +66,23 @@ export class OnChainProvider {
     ]);
 
     const sqrtPriceX96 = BigInt(slot.sqrtPriceX96);
-    // Fórmula: price = (sqrtPriceX96 / 2^96)^2 * 10^(decimals0 - decimals1)
+    
+    /**
+     * CORREÇÃO DA FÓRMULA:
+     * O preço de mercado (P) é calculado como:
+     * P = (sqrtPriceX96 / 2^96)^2
+     * Para ajustar os decimais:
+     * Preço Real = P * (10^decimal0 / 10^decimal1)
+     */
+    
+    // 1. Preço bruto (proporção entre os tokens)
     const rawPrice = (Number(sqrtPriceX96) / Math.pow(2, 96)) ** 2;
+    
+    // 2. Ajuste de decimais (10^18 / 10^6 = 10^12)
     const decimalAdj = Math.pow(10, token0Decimals - token1Decimals);
-    // Para par token1/token0 (ex: ARB/USDC) inverte-se o preço
-    const price = 1 / (rawPrice / decimalAdj);
+    
+    // 3. Preço de 1 token0 em termos de token1 (Quantos USDC por 1 WPOL)
+    const price = rawPrice * decimalAdj;
 
     return { price, liquidity: liq.toString() };
   }
