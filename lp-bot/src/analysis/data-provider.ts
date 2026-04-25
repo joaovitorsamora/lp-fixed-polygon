@@ -1,313 +1,495 @@
 /**
  * DataProvider — Camada de abstração para fontes de dados de mercado
- *
- * Prioridade:
- *   1. On-Chain (RPC direto — slot0 do pool Uniswap V3)
- *   2. GeckoTerminal API (OHLCV + pool data, gratuito, sem API key)
- *   3. Binance API (fallback CEX)
- *   4. Cache local (último dado válido — TTL 5min)
  */
 
 import { ethers, getAddress } from "ethers";
 import { MockDataProvider, MockScenario } from "./mock-provider";
 
 export interface OHLCV {
-  timestamp: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+ timestamp:number;
+ open:number;
+ high:number;
+ low:number;
+ close:number;
+ volume:number;
 }
 
 export interface PoolData {
-  price: number;
-  priceChange24h: number;
-  volume24h: number;
-  liquidity: number;
-  feeTier: number;
-  token0Symbol: string;
-  token1Symbol: string;
+ price:number;
+ priceChange24h:number;
+ volume24h:number;
+ liquidity:number;
+ feeTier:number;
+ token0Symbol:string;
+ token1Symbol:string;
 }
 
 export interface PairConfig {
-  geckoNetwork:    string;
-  geckoPoolAddress:string;
-  binanceSymbol:   string;
+ geckoNetwork:string;
+ geckoPoolAddress:string;
+ binanceSymbol:string;
 }
 
-// ── On-Chain Provider (leitura direta do slot0 do pool) ──────────────────────
-
-const UNIV3_POOL_ABI = [
-  "function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
-  "function liquidity() external view returns (uint128)",
+const UNIV3_POOL_ABI=[
+"function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16,uint16,uint16,uint8,bool)",
+"function liquidity() view returns(uint128)",
+"function token0() view returns(address)",
+"function token1() view returns(address)"
 ];
 
-// ── On-Chain Provider corrigido ──────────────────────
+const ERC20_ABI=[
+"function decimals() view returns(uint8)",
+"function symbol() view returns(string)"
+];
 
 export class OnChainProvider {
-  private provider: ethers.JsonRpcProvider;
+ private provider:ethers.JsonRpcProvider;
 
-  constructor(rpcUrl: string) {
-    this.provider = new ethers.JsonRpcProvider(rpcUrl);
-  }
+ constructor(rpcUrl:string){
+   this.provider=new ethers.JsonRpcProvider(rpcUrl);
+ }
 
-  async fetchCurrentPoolData(
-    poolAddress: string,
-    token0Decimals = 18,   // WPOL = 18 (Geralmente token0 na Polygon para este par)
-    token1Decimals = 6     // USDC = 6 (Geralmente token1)
-  ): Promise<{ price: number; liquidity: string }> {
-    const safeAddress = getAddress(poolAddress);
-    const contract = new ethers.Contract(safeAddress, UNIV3_POOL_ABI, this.provider);
+ async fetchCurrentPoolData(
+   poolAddress:string
+ ):Promise<{price:number; liquidity:string}> {
 
-    const [slot, liq] = await Promise.all([
+   const safeAddress=getAddress(poolAddress);
+
+   const contract=
+   new ethers.Contract(
+      safeAddress,
+      UNIV3_POOL_ABI,
+      this.provider
+   );
+
+   const [slot,liq,token0Addr,token1Addr]=await Promise.all([
       contract.slot0(),
       contract.liquidity(),
-    ]);
+      contract.token0(),
+      contract.token1()
+   ]);
 
-    const sqrtPriceX96 = BigInt(slot.sqrtPriceX96);
-    
-    /**
-     * CORREÇÃO DA FÓRMULA:
-     * O preço de mercado (P) é calculado como:
-     * P = (sqrtPriceX96 / 2^96)^2
-     * Para ajustar os decimais:
-     * Preço Real = P * (10^decimal0 / 10^decimal1)
-     */
-    
-    // 1. Preço bruto (proporção entre os tokens)
-    const rawPrice = (Number(sqrtPriceX96) / Math.pow(2, 96)) ** 2;
-    
-    // 2. Ajuste de decimais (10^18 / 10^6 = 10^12)
-    const decimalAdj = Math.pow(10, token0Decimals - token1Decimals);
-    
-    // 3. Preço de 1 token0 em termos de token1 (Quantos USDC por 1 WPOL)
-    const price = rawPrice * decimalAdj;
+   const token0=
+   new ethers.Contract(
+      token0Addr,
+      ERC20_ABI,
+      this.provider
+   );
 
-    return { price, liquidity: liq.toString() };
-  }
+   const token1=
+   new ethers.Contract(
+      token1Addr,
+      ERC20_ABI,
+      this.provider
+   );
+
+   const [dec0,dec1]=await Promise.all([
+      token0.decimals(),
+      token1.decimals()
+   ]);
+
+   const sqrtPriceX96=
+   BigInt(slot.sqrtPriceX96);
+
+   const rawPrice=
+   (Number(sqrtPriceX96)/Math.pow(2,96))**2;
+
+   const decimalAdj=
+   Math.pow(
+      10,
+      Number(dec0)-Number(dec1)
+   );
+
+   let price=rawPrice*decimalAdj;
+
+   const usdc=
+   process.env.USDC_ADDRESS?.toLowerCase();
+
+   if(
+      usdc &&
+      token0Addr.toLowerCase()===usdc
+   ){
+      price=1/price;
+   }
+
+   if(
+      !Number.isFinite(price) ||
+      price<=0
+   ){
+      throw new Error(
+       "Preço inválido calculado do slot0"
+      );
+   }
+
+   return {
+      price,
+      liquidity: liq.toString()
+   };
+ }
 }
-
-// ── GeckoTerminal Provider ────────────────────────────────────────────────────
 
 export class GeckoTerminalProvider {
-  private readonly base = "https://api.geckoterminal.com/api/v2";
+ private readonly base=
+ "https://api.geckoterminal.com/api/v2";
 
-  async fetchOHLCV(
-    network: string,
-    poolAddress: string,
-    limit = 50,
-    timeframe: "day" | "hour" | "minute" = "hour"
-  ): Promise<OHLCV[]> {
-    const url = `${this.base}/networks/${network}/pools/${poolAddress}/ohlcv/${timeframe}?limit=${limit}&token=base`;
+ async fetchOHLCV(
+  network:string,
+  poolAddress:string,
+  limit=50,
+  timeframe:"day"|"hour"|"minute"="hour"
+ ):Promise<OHLCV[]> {
 
-    const res = await fetch(url, {
-      headers: { Accept: "application/json", "User-Agent": "lp-manager-bot/2.0" },
-    });
-    if (!res.ok) throw new Error(`GeckoTerminal OHLCV ${res.status}`);
+ const url=
+ `${this.base}/networks/${network}/pools/${poolAddress}/ohlcv/${timeframe}?limit=${limit}&token=base`;
 
-    const data = await res.json() as {
-      data: { attributes: { ohlcv_list: [number, number, number, number, number, number][] } };
-    };
+ const res=await fetch(url,{headers:{
+  Accept:"application/json",
+  "User-Agent":"lp-manager-bot/2.0"
+ }});
 
-    return data.data.attributes.ohlcv_list.map(([ts, o, h, l, c, v]) => ({
-      timestamp: ts * 1000, open: o, high: h, low: l, close: c, volume: v,
-    }));
-  }
+ if(!res.ok){
+  throw new Error(
+   `GeckoTerminal OHLCV ${res.status}`
+  );
+ }
 
-  async fetchPoolData(network: string, poolAddress: string): Promise<PoolData> {
-    const url = `${this.base}/networks/${network}/pools/${poolAddress}`;
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) throw new Error(`GeckoTerminal pool ${res.status}`);
+ const data=await res.json() as {
+ data:{attributes:{
+ ohlcv_list:[number,number,number,number,number,number][]
+ }}
+ };
 
-    const data = await res.json() as {
-      data: { attributes: {
-        base_token_price_usd: string;
-        price_change_percentage: { h24: string };
-        volume_usd: { h24: string };
-        reserve_in_usd: string;
-        pool_fee: string;
-        name: string;
-      }};
-    };
+ return data.data.attributes.ohlcv_list.map(
+ ([ts,o,h,l,c,v])=>(
+ {
+ timestamp:ts*1000,
+ open:o,
+ high:h,
+ low:l,
+ close:c,
+ volume:v
+ })
+ );
+ }
 
-    const a = data.data.attributes;
-    return {
-      price:          parseFloat(a.base_token_price_usd),
-      priceChange24h: parseFloat(a.price_change_percentage.h24) / 100,
-      volume24h:      parseFloat(a.volume_usd.h24),
-      liquidity:      parseFloat(a.reserve_in_usd),
-      feeTier:        parseFloat(a.pool_fee || "0.3") / 100,
-      token0Symbol:   a.name.split(" / ")[0] ?? "TOKEN0",
-      token1Symbol:   a.name.split(" / ")[1]?.split(" ")[0] ?? "TOKEN1",
-    };
-  }
+ async fetchPoolData(
+  network:string,
+  poolAddress:string
+ ):Promise<PoolData>{
+
+ const url=
+ `${this.base}/networks/${network}/pools/${poolAddress}`;
+
+ const res=await fetch(url,{headers:{
+ Accept:"application/json"
+ }});
+
+ if(!res.ok){
+ throw new Error(
+ `GeckoTerminal pool ${res.status}`
+ );
+ }
+
+ const data=await res.json() as {
+ data:{attributes:{
+ base_token_price_usd:string;
+ price_change_percentage:{h24:string};
+ volume_usd:{h24:string};
+ reserve_in_usd:string;
+ pool_fee:string;
+ name:string;
+ }}
+ };
+
+ const a=data.data.attributes;
+
+ return {
+ price:parseFloat(a.base_token_price_usd),
+ priceChange24h:
+ parseFloat(a.price_change_percentage.h24)/100,
+ volume24h:
+ parseFloat(a.volume_usd.h24),
+ liquidity:
+ parseFloat(a.reserve_in_usd),
+ feeTier:
+ parseFloat(a.pool_fee||"0.3")/100,
+ token0Symbol:
+ a.name.split(" / ")[0]??"TOKEN0",
+ token1Symbol:
+ a.name.split(" / ")[1]?.split(" ")[0]??"TOKEN1"
+ };
+ }
 }
-
-// ── Binance Provider ──────────────────────────────────────────────────────────
 
 export class BinanceProvider {
-  private readonly base = "https://api.binance.com/api/v3";
+ private readonly base=
+ "https://api.binance.com/api/v3";
 
-  async fetchOHLCV(symbol: string, interval = "1h", limit = 50): Promise<OHLCV[]> {
-    const url = `${this.base}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Binance klines ${res.status}`);
+ async fetchOHLCV(
+ symbol:string,
+ interval="1h",
+ limit=50
+ ):Promise<OHLCV[]>{
 
-    const raw = await res.json() as [number, string, string, string, string, string][];
-    return raw.map(([ts, o, h, l, c, v]) => ({
-      timestamp: ts,
-      open:   parseFloat(o), high: parseFloat(h),
-      low:    parseFloat(l), close: parseFloat(c),
-      volume: parseFloat(v),
-    }));
-  }
+ const url=
+ `${this.base}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
 
-  async fetch24hStats(symbol: string): Promise<{ price: number; change24h: number; volume: number }> {
-    const url = `${this.base}/ticker/24hr?symbol=${symbol}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Binance 24hr ${res.status}`);
-    const d = await res.json() as { lastPrice: string; priceChangePercent: string; volume: string };
-    return {
-      price:     parseFloat(d.lastPrice),
-      change24h: parseFloat(d.priceChangePercent) / 100,
-      volume:    parseFloat(d.volume),
-    };
-  }
+ const res=await fetch(url);
+
+ if(!res.ok){
+ throw new Error(
+ `Binance klines ${res.status}`
+ );
+ }
+
+ const raw=await res.json() as
+ [number,string,string,string,string,string][];
+
+ return raw.map(
+ ([ts,o,h,l,c,v])=>({
+ timestamp:ts,
+ open:parseFloat(o),
+ high:parseFloat(h),
+ low:parseFloat(l),
+ close:parseFloat(c),
+ volume:parseFloat(v)
+ })
+ );
+ }
+
+ async fetch24hStats(symbol:string){
+ const url=
+ `${this.base}/ticker/24hr?symbol=${symbol}`;
+
+ const res=await fetch(url);
+ if(!res.ok){
+ throw new Error(
+ `Binance 24hr ${res.status}`
+ );
+ }
+
+ const d=await res.json() as {
+ lastPrice:string;
+ priceChangePercent:string;
+ volume:string;
+ };
+
+ return {
+ price:parseFloat(d.lastPrice),
+ change24h:
+ parseFloat(d.priceChangePercent)/100,
+ volume:
+ parseFloat(d.volume)
+ };
+ }
 }
-
-// ── DataFetcher — orquestra com fallback + cache ───────────────────────────────
 
 export class DataFetcher {
-  protected gecko   = new GeckoTerminalProvider();
-  protected binance = new BinanceProvider();
-  protected onChain = new OnChainProvider(
-    process.env.RPC_URL || "https://arb1.arbitrum.io/rpc"
-  );
+ protected gecko=new GeckoTerminalProvider();
+ protected binance=new BinanceProvider();
 
-  private cache: {
-    ohlcv:     OHLCV[];
-    poolData:  Partial<PoolData>;
-    fetchedAt: number;
-    source:    string;
-  } | null = null;
+ protected onChain=
+ new OnChainProvider(
+ process.env.RPC_URL||
+ "https://polygon-rpc.com"
+ );
 
-  private readonly CACHE_TTL_MS = 5 * 60_000;
+ private cache:{
+ ohlcv:OHLCV[];
+ poolData:Partial<PoolData>;
+ fetchedAt:number;
+ source:string;
+ }|null=null;
 
-  async fetchOHLCV(pair: PairConfig): Promise<{ candles: OHLCV[]; source: string }> {
-    // 1. GeckoTerminal
-    try {
-      const candles = await this.gecko.fetchOHLCV(pair.geckoNetwork, pair.geckoPoolAddress, 50);
-      this.updateCache(candles, {});
-      return { candles, source: "GeckoTerminal" };
-    } catch (e) {
-      console.warn(`[DataFetcher] GeckoTerminal OHLCV falhou: ${(e as Error).message}`);
-    }
+ private readonly CACHE_TTL_MS=
+ 5*60_000;
 
-    // 2. Binance fallback
-    try {
-      const candles = await this.binance.fetchOHLCV(pair.binanceSymbol, "1h", 50);
-      this.updateCache(candles, {});
-      return { candles, source: "Binance" };
-    } catch (e) {
-      console.warn(`[DataFetcher] Binance OHLCV falhou: ${(e as Error).message}`);
-    }
+ async fetchOHLCV(pair:PairConfig){
+ try{
+ const candles=
+ await this.gecko.fetchOHLCV(
+ pair.geckoNetwork,
+ pair.geckoPoolAddress,
+ 50
+ );
 
-    // 3. Cache local
-    if (this.cache && Date.now() - this.cache.fetchedAt < this.CACHE_TTL_MS) {
-      const age = Math.round((Date.now() - this.cache.fetchedAt) / 1000);
-      console.warn(`[DataFetcher] Usando cache (${age}s atrás)`);
-      return { candles: this.cache.ohlcv, source: `cache` };
-    }
+ this.updateCache(candles,{});
 
-    throw new Error("Todas as fontes de dados falharam e cache expirou");
-  }
+ return {
+ candles,
+ source:"GeckoTerminal"
+ };
+ }catch(e){
+ console.warn(
+ `[DataFetcher] Gecko falhou ${(e as Error).message}`
+ );
+ }
 
-  async fetchPoolData(pair: PairConfig): Promise<Partial<PoolData> & { source: string }> {
-    // 1. On-Chain (RPC direto — mais preciso para preço atual)
-    try {
-      const cleanAddress = getAddress(pair.geckoPoolAddress);
-      const data = await this.onChain.fetchCurrentPoolData(cleanAddress);
+ try{
+ const candles=
+ await this.binance.fetchOHLCV(
+ pair.binanceSymbol,
+ "1h",
+ 50
+ );
 
-      let stats = { change24h: 0, volume: 0 };
-      try { stats = await this.binance.fetch24hStats(pair.binanceSymbol); } catch { /* ok */ }
+ return {
+ candles,
+ source:"Binance"
+ };
+ }catch(e){
+ console.warn(
+ `[DataFetcher] Binance falhou ${(e as Error).message}`
+ );
+ }
 
-      return {
-        price:         data.price,
-        liquidity:     parseFloat(data.liquidity),
-        priceChange24h:stats.change24h,
-        volume24h:     stats.volume,
-        source:        "On-Chain (RPC)",
-      };
-    } catch (e) {
-      console.warn(`[DataFetcher] On-Chain falhou: ${(e as Error).message}`);
-    }
+ if(
+ this.cache &&
+ Date.now()-this.cache.fetchedAt<
+ this.CACHE_TTL_MS
+ ){
+ return {
+ candles:this.cache.ohlcv,
+ source:"cache"
+ };
+ }
 
-    // 2. GeckoTerminal
-    try {
-      const pool = await this.gecko.fetchPoolData(pair.geckoNetwork, pair.geckoPoolAddress);
-      return { ...pool, source: "GeckoTerminal" };
-    } catch (e) {
-      console.warn(`[DataFetcher] GeckoTerminal pool falhou: ${(e as Error).message}`);
-    }
+ throw new Error(
+ "Todas as fontes falharam"
+ );
+ }
 
-    // 3. Binance
-    try {
-      const s = await this.binance.fetch24hStats(pair.binanceSymbol);
-      return { price: s.price, priceChange24h: s.change24h, volume24h: s.volume, source: "Binance" };
-    } catch { /* silencioso */ }
+ async fetchPoolData(pair:PairConfig){
+ try{
+ const data=
+ await this.onChain.fetchCurrentPoolData(
+ getAddress(pair.geckoPoolAddress)
+ );
 
-    return { source: "none" };
-  }
+ let stats={
+ change24h:0,
+ volume:0
+ };
 
-  private updateCache(ohlcv: OHLCV[], poolData: Partial<PoolData>): void {
-    this.cache = { ohlcv, poolData, fetchedAt: Date.now(), source: "gecko" };
-  }
+ try{
+ stats=
+ await this.binance.fetch24hStats(
+ pair.binanceSymbol
+ );
+ }catch{}
 
-  static closePrices(candles: OHLCV[]): number[] {
-    return candles.map(c => c.close);
-  }
+ return {
+ price:data.price,
+ liquidity:
+ parseFloat(data.liquidity),
+ priceChange24h:
+ stats.change24h,
+ volume24h:
+ stats.volume,
+ source:"On-Chain"
+ };
+ }catch(e){
+ console.warn(
+ `[DataFetcher] onchain falhou ${(e as Error).message}`
+ );
+ }
 
-  get isCacheValid(): boolean {
-    return !!this.cache && Date.now() - this.cache.fetchedAt < this.CACHE_TTL_MS;
-  }
+ try{
+ const pool=
+ await this.gecko.fetchPoolData(
+ pair.geckoNetwork,
+ pair.geckoPoolAddress
+ );
+
+ return {
+ ...pool,
+ source:"GeckoTerminal"
+ };
+ }catch{}
+
+ const s=
+ await this.binance.fetch24hStats(
+ pair.binanceSymbol
+ );
+
+ return {
+ price:s.price,
+ priceChange24h:s.change24h,
+ volume24h:s.volume,
+ source:"Binance"
+ };
+ }
+
+ private updateCache(
+ ohlcv:OHLCV[],
+ poolData:Partial<PoolData>
+ ){
+ this.cache={
+ ohlcv,
+ poolData,
+ fetchedAt:Date.now(),
+ source:"gecko"
+ };
+ }
+
+ static closePrices(
+ candles:OHLCV[]
+ ){
+ return candles.map(c=>c.close);
+ }
 }
 
-// ── DataFetcherWithMock — suporte a dados sintéticos ─────────────────────────
+export class DataFetcherWithMock
+extends DataFetcher{
 
-export class DataFetcherWithMock extends DataFetcher {
-  private mock: MockDataProvider | null = null;
+ private mock:
+ MockDataProvider|null=null;
 
-  constructor() {
-    super();
-    if (process.env.USE_MOCK === "true") {
-      const scenario = (process.env.MOCK_SCENARIO ?? "sideways") as MockScenario;
-      // Base price para ARB (~$0.60)
-      this.mock = new MockDataProvider(scenario, 0.60);
-    }
-  }
+ constructor(){
+ super();
 
-  async fetchOHLCV(pair: PairConfig): Promise<{ candles: OHLCV[]; source: string }> {
-    if (this.mock) {
-      const candles = this.mock.generateOHLCV(50);
-      return { candles, source: `mock:${process.env.MOCK_SCENARIO ?? "sideways"}` };
-    }
-    return super.fetchOHLCV(pair);
-  }
+ if(
+ process.env.USE_MOCK==="true"
+ ){
+ const scenario=
+ (process.env.MOCK_SCENARIO??
+ "sideways") as MockScenario;
 
-  async fetchPoolData(pair: PairConfig): Promise<Partial<PoolData> & { source: string }> {
-    if (this.mock) {
-      // Pega o último preço gerado consistente com o OHLCV
-      const candles = this.mock.generateOHLCV(1);
-      const price = candles[0].close;
-      return {
-        price,
-        liquidity:     2_000_000,
-        priceChange24h:0,
-        volume24h:     3_000_000,
-        source:        "mock",
-      };
-    }
-    return super.fetchPoolData(pair);
-  }
+ this.mock=
+ new MockDataProvider(
+ scenario,
+ 0.60
+ );
+ }
+ }
+
+ async fetchOHLCV(pair:PairConfig){
+ if(this.mock){
+ return {
+ candles:
+ this.mock.generateOHLCV(50),
+ source:
+ `mock:${process.env.MOCK_SCENARIO}`
+ };
+ }
+
+ return super.fetchOHLCV(pair);
+ }
+
+ async fetchPoolData(pair:PairConfig){
+ if(this.mock){
+ const candles=
+ this.mock.generateOHLCV(1);
+
+ return {
+ price:candles[0].close,
+ liquidity:2000000,
+ priceChange24h:0,
+ volume24h:3000000,
+ source:"mock"
+ };
+ }
+
+ return super.fetchPoolData(pair);
+ }
 }

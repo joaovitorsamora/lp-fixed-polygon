@@ -49,7 +49,11 @@ export class RebalanceDecider {
       }, input);
     }
 
-    const deviationOk = rangeCheck.deviationPct >= config.minDeviationPct;
+    const deviationOk =
+  rangeCheck.deviationPct >= Math.max(
+    config.minDeviationPct,
+    0.003 // piso absoluto 0.3%
+  );
 
     if (!deviationOk) {
       return this.deny("Desvio insuficiente", {
@@ -80,7 +84,12 @@ export class RebalanceDecider {
 
     const feeIfStay = this.estimateFeeIfStay(position, config);
 
-    const economicOk = il + config.gasCostUSD > feeIfStay;
+ const gasPenalty = config.gasCostUSD * 0.3;
+
+// IL relevante OU movimento forte
+const economicOk =
+  il > gasPenalty ||
+  rangeCheck.deviationPct > 0.015;
 
     if (!economicOk) {
       return this.deny("Não vale economicamente", {

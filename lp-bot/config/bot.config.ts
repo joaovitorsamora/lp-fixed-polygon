@@ -32,36 +32,41 @@ export interface BotConfig {
 export const DEFAULT_CONFIG: BotConfig = {
   pair: "WPOL/USDC",
   pairConfig: {
-   geckoNetwork:     "polygon_pos", // Tente com underscore ou apenas "polygon"
-    geckoPoolAddress: "0xa374094527e1673a86de625aa59517c5de346d32", // Tudo em minúsculo
-    binanceSymbol:    "POLUSDT", 
+    geckoNetwork: "polygon_pos",
+    geckoPoolAddress: "0xa374094527e1673a86de625aa59517c5de346d32",
+    binanceSymbol: "POLUSDT",
   },
 
-  initialLiquidityUSD: 450000,
+  // ⚠️ CORREÇÃO CRÍTICA
+  initialLiquidityUSD: 4.5,
 
-  // Monitorização ativa: 30s é o ideal para não sobrecarregar o RPC mas reagir a tempo
-  intervalMs:  30_000, 
-  jitterMs:    2_000,           // Reduzi para 2s para o bot ser mais determinístico
-  cooldownMs:  5 * 60_000,      // Reduzido para 5min: essencial para ranges estreitos
+  // execução
+  intervalMs: 30_000,
+  jitterMs: 2_000,
+  cooldownMs: 10 * 60_000, // 10 min (mais realista)
 
-  // --- CONFIGURAÇÕES DE MAXIMIZAÇÃO DE TAXAS ---
-  minRangePct:     0.012,       // 1.2% (Ainda mais estreito para maior multiplicador de taxas)
-  maxRangePct:     0.04,        // 4% (Protege contra impermanent loss em picos de volatilidade)
-  atrPeriod:       14,
-  atrMultiplier:   1.2,         // Reduzi para 1.2: o range "cola" no preço atual
-  deadZonePct:     0.001,       // 0.1% zona morta: aproveita micro-oscilações
+  // RANGE (corrigido)
+ minRangePct: 0.10,  // 10%
+maxRangePct: 0.25,   // 25%
 
-  // --- EFICIÊNCIA DE EXECUÇÃO ---
-  minDeviationPct: 0.01,       // Rebalanceia com 0.3% de desvio (Mantém o preço sempre no centro)
-  maxSlippageBps:  30,          // 0.3% de slippage máximo para não perder lucro no swap
+  atrPeriod: 14,
+  atrMultiplier: 2.2,  // mais responsivo
 
-  maxVolatilityPct: 0.10,       // Permite operar com até 10% de vol (agressivo)
-  maxPriceDropPct:  0.07,       
+ deadZonePct: 0.005, // 0.5%
 
-  feeRatePct:  0.0005,          
-  gasCostUSD:  0.01,  
-  
-  tickSpacing: 10,               
+  // DECISÃO
+  minDeviationPct: 0.02, // 2%
+  maxSlippageBps: 30,
+
+  maxVolatilityPct: 0.10,
+  maxPriceDropPct: 0.07,
+
+  feeRatePct: 0.0005,
+
+  // ⚠️ REAL POLYGON GAS (não 0.01)
+  gasCostUSD: 0.08,
+
+  tickSpacing: 10,
 };
 
 export const PAIRS = {
