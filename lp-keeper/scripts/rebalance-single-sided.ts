@@ -1,4 +1,4 @@
-// scripts/rebalance-single-sided.ts
+// scripts/rebalance-single-sided.ts — VERSÃO FINAL CORRETA
 import { ethers } from "ethers";
 import dotenv from "dotenv";
 dotenv.config();
@@ -10,7 +10,7 @@ const provider = new ethers.JsonRpcProvider(process.env.RPC_URL!);
 const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
 
 const pool = new ethers.Contract(POOL, [
-  "function slot0() external view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)"
+  "function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)"
 ], provider);
 
 const contract = new ethers.Contract(KEEPER_CONTRACT, [
@@ -22,26 +22,25 @@ const contract = new ethers.Contract(KEEPER_CONTRACT, [
   "function keeperEthReserve() view returns (uint256)",
 ], wallet);
 
+function priceFromTick(tick: number): number {
+  return Math.pow(1.0001, tick) * 1e12;
+}
+
 async function main() {
-  // ── Ler tick atual DIRETAMENTE do pool ────────────────────────────────────
-  console.log("📡 Lendo tick atual do pool on-chain...");
+  // ── Ler tick atual do pool ─────────────────────────────────────────────────
   const slot0 = await pool.slot0();
-  const currentTick: number = Number(slot0[1]);
-  const sqrtPriceX96: bigint = slot0[0];
+  const currentTick = Number(slot0[1]);
+  const currentPriceUSD = priceFromTick(currentTick);
 
-  // Calcular preço a partir do sqrtPriceX96
-  const Q96 = 2n ** 96n;
-  const priceRaw = Number(sqrtPriceX96 * sqrtPriceX96 * BigInt(1e6)) / Number(Q96 * Q96 * BigInt(1e18));
-  
-  console.log("currentTick do pool:", currentTick);
-  console.log("preço atual:", priceRaw.toFixed(6), "USDC/WPOL");
+  console.log("📡 Pool on-chain:");
+  console.log("   currentTick:", currentTick);
+  console.log("   preço atual: $" + currentPriceUSD.toFixed(5));
 
-  // ── Estado do contrato ────────────────────────────────────────────────────
-  const [tokenId, cooldown, lastReb, slippage, keeperReserve] = await Promise.all([
+  // ── Estado do contrato ─────────────────────────────────────────────────────
+  const [tokenId, cooldown, lastReb, keeperReserve] = await Promise.all([
     contract.tokenId(),
     contract.cooldownSeconds(),
     contract.lastRebalanceTs(),
-    contract.slippageBps(),
     contract.keeperEthReserve(),
   ]);
 
@@ -49,39 +48,42 @@ async function main() {
   const cooldownLeft = (lastReb + cooldown) > now ? (lastReb + cooldown) - now : 0n;
   const polBal = await provider.getBalance(wallet.address);
 
-  console.log("\ntokenId:", tokenId.toString());
-  console.log("slippage:", slippage.toString(), "bps");
-  console.log("cooldown restante:", cooldownLeft.toString(), "s");
-  console.log("POL na wallet:", ethers.formatEther(polBal));
+  console.log("\n📋 Contrato:");
+  console.log("   tokenId:", tokenId.toString());
+  console.log("   cooldown:", cooldownLeft.toString(), "s");
+  console.log("   POL:", ethers.formatEther(polBal));
 
   if (cooldownLeft > 0n) {
     console.error(`\n❌ Aguarde ${cooldownLeft}s (~${Math.ceil(Number(cooldownLeft)/60)} min)`);
     process.exit(1);
   }
 
-  // ── Calcular ticks single-sided WPOL ─────────────────────────────────────
-  // Como temos 100% WPOL, a posição deve ficar COM TICKLOWER > CURRENTTICK
-  // Assim o Uniswap V3 aceita 100% token0 e a posição fica "in range aguardando"
-  const TICK_SPACING = 10;
-  
-  // tickLower = currentTick + 1 tick de espaço (alinhado)
-  const tickLower = (Math.floor(currentTick / TICK_SPACING) + 1) * TICK_SPACING;
-  // tickUpper = 30% acima (range amplo para não sair tão rápido)
-  const tickUpper = Math.ceil((currentTick * 1.30) / TICK_SPACING) * TICK_SPACING;
+  // ── Ticks single-sided: tickLower ACIMA do currentTick ────────────────────
+  // Isso garante posição 100% WPOL — NPM usa todo o amount0, sem revert de slippage
+  const SPACING = 10;
+  const tickLower = (Math.floor(currentTick / SPACING) + 2) * SPACING; // 2 espaços acima
+  const tickUpper = tickLower + 3000;                                   // range ~30% acima
 
-  const priceAtLower = Math.pow(1.0001, tickLower) / 1e12;
-  const priceAtUpper = Math.pow(1.0001, tickUpper) / 1e12;
+  const priceLower = priceFromTick(tickLower);
+  const priceUpper = priceFromTick(tickUpper);
 
-  console.log("\n=== Ticks Single-Sided WPOL ===");
-  console.log("tickLower:", tickLower, "→ $" + priceAtLower.toFixed(5));
-  console.log("tickUpper:", tickUpper, "→ $" + priceAtUpper.toFixed(5));
-  console.log("currentTick:", currentTick, "→ $" + priceRaw.toFixed(5));
-  console.log("Posição: 100% WPOL, ativa quando preço subir acima de $" + priceAtLower.toFixed(5));
+  console.log("\n📐 Ticks single-sided WPOL:");
+  console.log("   currentTick:", currentTick, "→ $" + currentPriceUSD.toFixed(5));
+  console.log("   tickLower:  ", tickLower,    "→ $" + priceLower.toFixed(5), "(preço de ativação)");
+  console.log("   tickUpper:  ", tickUpper,    "→ $" + priceUpper.toFixed(5));
+  console.log("   currentTick < tickLower?", currentTick < tickLower ? "✅ single-sided válido" : "❌");
+  console.log("   tL < tU?",    tickLower < tickUpper ? "✅" : "❌");
+  console.log("   alinhados?",  tickLower % 10 === 0 && tickUpper % 10 === 0 ? "✅" : "❌");
+  console.log("   Posição ativa quando preço subir acima de $" + priceLower.toFixed(5));
 
-  // currentPrice para o contrato (não afeta os ticks, só é armazenado)
-  const currentPrice = BigInt(Math.round(priceRaw * 1e18));
+  if (currentTick >= tickLower || tickLower >= tickUpper) {
+    console.error("\n❌ Ticks inválidos — abortando");
+    process.exit(1);
+  }
 
-  // ── Estimar gas ───────────────────────────────────────────────────────────
+  const currentPrice = BigInt(Math.round(currentPriceUSD * 1e18));
+
+  // ── Estimar gas ────────────────────────────────────────────────────────────
   console.log("\n💰 Estimando gas...");
   let gasEst: bigint;
   try {
@@ -92,25 +94,22 @@ async function main() {
   }
 
   const feeData = await provider.getFeeData();
-  const custo = gasEst * (feeData.gasPrice ?? 100_000_000_000n);
-  console.log("Gas estimado:", gasEst.toString());
-  console.log("Custo estimado:", ethers.formatEther(custo), "POL");
-  console.log("POL disponível:", ethers.formatEther(polBal));
+  const custo   = gasEst * (feeData.gasPrice ?? 100_000_000_000n);
+  console.log("   Gas:", gasEst.toString());
+  console.log("   Custo:", ethers.formatEther(custo), "POL");
 
   if (polBal < custo + keeperReserve) {
-    console.error("\n❌ POL insuficiente!");
-    console.error("   Necessário:", ethers.formatEther(custo + keeperReserve));
-    console.error("   Disponível:", ethers.formatEther(polBal));
+    console.error("❌ POL insuficiente! Precisa:", ethers.formatEther(custo + keeperReserve));
     process.exit(1);
   }
 
-  // ── Executar ──────────────────────────────────────────────────────────────
-  console.log("\n🔄 Executando rebalance single-sided...");
+  // ── Enviar ─────────────────────────────────────────────────────────────────
+  console.log("\n🔄 Enviando rebalance...");
   const tx = await contract.rebalance(tickLower, tickUpper, currentPrice, {
     gasLimit: gasEst * 120n / 100n,
   });
 
-  console.log("TX:", tx.hash);
+  console.log("   TX:", tx.hash);
   const receipt = await tx.wait();
 
   if (receipt.status === 0) {
@@ -118,9 +117,9 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("\n✅ Rebalance ok! Gas usado:", receipt.gasUsed.toString());
-  console.log("🎯 Posição agora está IN RANGE (single-sided WPOL)");
-  console.log("   Gera fees quando preço subir acima de $" + priceAtLower.toFixed(5));
+  console.log("\n✅ Sucesso! Gas:", receipt.gasUsed.toString());
+  console.log("🎯 Posição single-sided WPOL criada");
+  console.log("   Ativa (gera fees) quando WPOL subir acima de $" + priceLower.toFixed(5));
   console.log("   https://revert.finance/#/account/0xde95b32d6b0ff10c5bcec9e13f41aca94d352e67/polygon");
 }
 
