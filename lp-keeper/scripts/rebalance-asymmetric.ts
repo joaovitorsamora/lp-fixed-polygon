@@ -1,161 +1,239 @@
-// scripts/rebalance-asymmetric.ts
+// scripts/rebalance-centered.ts
+//
+// Reposiciona o range com o preço EXATAMENTE no centro.
+//
+// Fixes em relação ao rebalance-asymmetric.ts:
+//
+// 1. currentPrice corrigido:
+//    O contrato guarda currentPrice só para tracking — não afeta o slippage.
+//    Mas o valor passado deve ser o preço em USD * 1e18 (simples).
+//    priceFromTick() já dá USDC/WMATIC com ajuste 1e12, então:
+//    currentPriceUSD = 1 / (priceFromTick(tick) / 1e12) ... não.
+//    Na verdade: tick do pool WMATIC/USDC dá price = USDC/WMATIC * 1e12
+//    Então polPriceUSD = Math.pow(1.0001, tick) / 1e12... não.
+//    Forma correta: sqrtPriceX96 → rawPrice → / 1e12 = USD/WMATIC.
+//    Passamos como uint256: Math.round(polPriceUSD * 1e18).
+//
+// 2. Slippage zerado temporariamente para o rebalance:
+//    A posição tem 98.58% WMATIC e 1.42% USDC.
+//    Ao rebalancear para range centrado (50/50), a Uniswap vai usar
+//    mais USDC do que temos. O amount1Min com slippage 1% rejeita
+//    porque a Uniswap retorna menos USDC do que amount1Desired.
+//    SOLUÇÃO: setar slippage = 0 antes, rebalancear, restaurar depois.
+//    (owner = keeper = sua carteira, então pode chamar setSlippageBps)
+//
+// 3. Range centrado puro: tickLower = center - HALF, tickUpper = center + HALF
+
 import { ethers } from "ethers";
 import dotenv from "dotenv";
 dotenv.config();
 
-const KEEPER_CONTRACT = "0xde95b32d6B0ff10C5Bcec9e13F41aCA94D352e67";
-const POOL = "0xB6e57ed85c4c9dbfEF2a68711e9d6f36c56e0FcB";
-
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL!);
 const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
 
-const pool = new ethers.Contract(POOL, [
-  "function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)"
-], provider);
+const CONTRACT = process.env.KEEPER_CONTRACT!;
 
-const contract = new ethers.Contract(KEEPER_CONTRACT, [
-  "function rebalance(int24,int24,uint256) external",
-  "function setSlippageBps(uint256) external",
-  "function slippageBps() view returns (uint256)",
-  "function tokenId() view returns (uint256)",
-  "function cooldownSeconds() view returns (uint256)",
-  "function lastRebalanceTs() view returns (uint256)",
-  "function keeperEthReserve() view returns (uint256)",
-], wallet);
+const contract = new ethers.Contract(
+  CONTRACT,
+  [
+    "function rebalance(int24,int24,uint256) external",
+    "function setSlippageBps(uint256) external",
+    "function slippageBps() view returns (uint256)",
+    "function cooldownSeconds() view returns (uint256)",
+    "function lastRebalanceTs() view returns (uint256)",
+    "function keeper() view returns (address)",
+    "function owner() view returns (address)",
+    "function tokenId() view returns (uint256)",
+    "function tickLower() view returns (int24)",
+    "function tickUpper() view returns (int24)",
+  ],
+  wallet
+);
 
-function priceFromTick(tick: number): number {
-  return Math.pow(1.0001, tick) * 1e12;
-}
+const POOL = new ethers.Contract(
+  "0xB6e57ed85c4c9dbfEF2a68711e9d6f36c56e0FcB",
+  ["function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool)"],
+  provider
+);
 
-function sqrtPrice(tick: number): number {
-  return Math.sqrt(Math.pow(1.0001, tick));
+const SPACING = 10;
+// Largura total do range em ticks.
+// 500 ticks de cada lado = ~5% de cada lado do centro.
+// Com tick spacing 10 e WMATIC ~$0.092:
+//   1 tick ≈ 0.01% de variação de preço
+//   500 ticks ≈ 5% de variação → range de ±5% centrado no preço atual
+const HALF_WIDTH = 500;
+
+async function getPolPriceFromSlot0(): Promise<{ polPriceUSD: number; currentTick: number }> {
+  const slot0 = await POOL.slot0();
+  const sqrtPriceX96 = BigInt(slot0[0].toString());
+  const currentTick  = Number(slot0[1]);
+
+  // sqrtPriceX96: encode price = token1/token0 sem ajuste de decimais
+  // token0 = WMATIC (18 dec), token1 = USDC (6 dec)
+  // rawPrice = (sqrtPriceX96 / 2^96)^2
+  // polPriceUSD = rawPrice * 10^(dec1-dec0) = rawPrice / 10^12
+  const sqrtFloat   = Number(sqrtPriceX96) / (2 ** 96);
+  const rawPrice    = sqrtFloat * sqrtFloat;
+  const polPriceUSD = rawPrice / 1e12;
+
+  return { polPriceUSD, currentTick };
 }
 
 async function main() {
-  // ── Pool ──────────────────────────────────────────────────────────────────
-  const slot0 = await pool.slot0();
-  const currentTick = Number(slot0[1]);
-  const currentPriceUSD = priceFromTick(currentTick);
+  console.log("━".repeat(52));
+  console.log("🎯 Rebalance Centrado — WMATIC/USDC");
+  console.log("━".repeat(52));
 
-  console.log("📡 Pool on-chain:");
-  console.log("   currentTick:", currentTick);
-  console.log("   preço atual: $" + currentPriceUSD.toFixed(5));
-
-  // ── Contrato ───────────────────────────────────────────────────────────────
-  const [tokenId, cooldown, lastReb, slippage, keeperReserve] = await Promise.all([
+  // ── Verificar quem está chamando ──────────────────────────────────────────
+  const [keeperAddr, ownerAddr, currentTokenId, currentTL, currentTU] = await Promise.all([
+    contract.keeper(),
+    contract.owner(),
     contract.tokenId(),
-    contract.cooldownSeconds(),
-    contract.lastRebalanceTs(),
-    contract.slippageBps(),
-    contract.keeperEthReserve(),
+    contract.tickLower(),
+    contract.tickUpper(),
   ]);
 
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const cooldownLeft = (lastReb + cooldown) > now ? (lastReb + cooldown) - now : 0n;
-  const polBal = await provider.getBalance(wallet.address);
+  console.log(`\nContrato:  ${CONTRACT}`);
+  console.log(`Carteira:  ${wallet.address}`);
+  console.log(`É keeper?  ${keeperAddr.toLowerCase() === wallet.address.toLowerCase() ? "✅" : "❌"}`);
+  console.log(`É owner?   ${ownerAddr.toLowerCase() === wallet.address.toLowerCase() ? "✅" : "❌"}`);
+  console.log(`tokenId:   ${currentTokenId}`);
+  console.log(`Ticks atuais: [${currentTL}, ${currentTU}]`);
 
-  console.log("\n📋 Contrato:");
-  console.log("   tokenId:", tokenId.toString());
-  console.log("   slippage:", slippage.toString(), "bps");
-  console.log("   cooldown:", cooldownLeft.toString(), "s");
-  console.log("   POL:", ethers.formatEther(polBal));
-
-  if (cooldownLeft > 0n) {
-    console.error(`\n❌ Aguarde ${cooldownLeft}s (~${Math.ceil(Number(cooldownLeft)/60)} min)`);
+  if (keeperAddr.toLowerCase() !== wallet.address.toLowerCase()) {
+    console.error("❌ Sua carteira não é keeper. Abortando.");
     process.exit(1);
   }
 
-  // ── Calcular ticks assimétricos ───────────────────────────────────────────
-  // tickLower: 30% abaixo do preço atual (amplo, lado esquerdo)
-  // tickUpper: calculado para que o NPM use >= 91% do WPOL disponível
-  // Isso garante que amount0_usado >= min0 com slippage=1000bps (máximo permitido)
-  const SPACING = 10;
-  const sqrtC = sqrtPrice(currentTick);
+  // ── Cooldown ──────────────────────────────────────────────────────────────
+  const [cooldown, lastTs] = await Promise.all([
+    contract.cooldownSeconds(),
+    contract.lastRebalanceTs(),
+  ]);
 
-  // tickLower fixo: 30% abaixo
-    const tickLower = -303740;
-    const sqrtL = sqrtPrice(tickLower);
+  const now       = BigInt(Math.floor(Date.now() / 1000));
+  const remaining = Number(lastTs) + Number(cooldown) - Number(now);
 
-  // tickUpper: resolver para fração = 93% (margem sobre o mínimo de 90%)
-  // fração = (sqrtC - sqrtL) / (sqrtU - sqrtL) = 0.93
-  // sqrtU = (sqrtC - sqrtL) / 0.93 + sqrtL
-  const targetFraction = 0.93;
-  const sqrtU_needed = (sqrtC - sqrtL) / targetFraction + sqrtL;
-  const tickU_raw = Math.log(sqrtU_needed * sqrtU_needed) / Math.log(1.0001);
-  // tickUpper: currentTick + 170 ticks (margem segura de ~2.5 WPOL sobre o mínimo)
-const tickUpper = (Math.floor(currentTick / SPACING) + 17) * SPACING;// Verificar fração real com ticks alinhados
-  const sqrtU = sqrtPrice(tickUpper);
-  const realFraction = (sqrtC - sqrtL) / (sqrtU - sqrtL);
-  const amount0 = 49.11431446;
-  const wpolUsed = amount0 * realFraction;
-  const min0_1000bps = amount0 * 0.90;
+  if (remaining > 0) {
+    console.log(`\n⏳ Cooldown ativo: ${remaining}s (~${Math.ceil(remaining/60)}min)`);
+    console.log("   Aguardando...");
+    await new Promise<void>(r => {
+      const iv = setInterval(() => {
+        const rem = Number(lastTs) + Number(cooldown) - Math.floor(Date.now()/1000);
+        if (rem <= 0) { clearInterval(iv); console.log(""); r(); }
+        else process.stdout.write(`\r   ${rem}s restantes...   `);
+      }, 1000);
+    });
+  }
 
-  console.log("\n📐 Ticks assimétricos (lower amplo, upper próximo):");
-  console.log("   tickLower:", tickLower, "→ $" + priceFromTick(tickLower).toFixed(5));
-  console.log("   currentTick:", currentTick, "→ $" + currentPriceUSD.toFixed(5), "(dentro do range)");
-  console.log("   tickUpper:", tickUpper, "→ $" + priceFromTick(tickUpper).toFixed(5));
-  console.log("   fração WPOL usado:", (realFraction * 100).toFixed(1) + "%");
-  console.log("   WPOL estimado usado:", wpolUsed.toFixed(2), "de", amount0.toFixed(2));
-  console.log("   min0 (slippage 1000bps):", min0_1000bps.toFixed(2));
-  console.log("   passa slippage check?", wpolUsed >= min0_1000bps ? "✅ SIM" : "❌ NÃO");
-  console.log("   IN RANGE?", tickLower <= currentTick && currentTick < tickUpper ? "✅" : "❌");
+  // ── Preço atual on-chain ──────────────────────────────────────────────────
+  console.log("\n💱 Lendo preço on-chain...");
+  const { polPriceUSD, currentTick } = await getPolPriceFromSlot0();
+  console.log(`   Tick atual:   ${currentTick}`);
+  console.log(`   POL price:    $${polPriceUSD.toFixed(6)}`);
 
-  if (!(tickLower <= currentTick && currentTick < tickUpper) || wpolUsed < min0_1000bps) {
-    console.error("\n❌ Validação falhou — abortando");
+  // ── Calcular range centrado ───────────────────────────────────────────────
+  // Alinhar o centro ao tick spacing
+  const centerTick = Math.round(currentTick / SPACING) * SPACING;
+  const tickLower  = centerTick - HALF_WIDTH;
+  const tickUpper  = centerTick + HALF_WIDTH;
+
+  // Verificar alinhamento
+  if (tickLower % SPACING !== 0 || tickUpper % SPACING !== 0) {
+    console.error(`❌ Ticks não alinhados: [${tickLower}, ${tickUpper}]`);
     process.exit(1);
   }
 
-  // ── Passo 1: ajustar slippage para 1000bps (máximo) ───────────────────────
-  if (slippage !== 1000n) {
-    console.log("\n⚙️  Ajustando slippage para 1000bps...");
-    const txS = await contract.setSlippageBps(1000, { gasLimit: 80_000 });
-    console.log("   TX:", txS.hash);
-    await txS.wait();
-    console.log("   ✅ Slippage = 1000bps");
+  // Preço do range em USD
+  // priceInPool = 1.0001^tick, polPriceUSD = priceInPool / 1e12
+  const priceLowerUSD = Math.pow(1.0001, tickLower) / 1e12;
+  const priceUpperUSD = Math.pow(1.0001, tickUpper) / 1e12;
+  const rangePctBelow = ((polPriceUSD - priceLowerUSD) / polPriceUSD * 100).toFixed(1);
+  const rangePctAbove = ((priceUpperUSD - polPriceUSD) / polPriceUSD * 100).toFixed(1);
+
+  console.log(`\n📐 Novo range centrado:`);
+  console.log(`   centerTick:  ${centerTick}`);
+  console.log(`   tickLower:   ${tickLower}  ($${priceLowerUSD.toFixed(5)}, -${rangePctBelow}%)`);
+  console.log(`   tickUpper:   ${tickUpper}  ($${priceUpperUSD.toFixed(5)}, +${rangePctAbove}%)`);
+  console.log(`   Preço atual: $${polPriceUSD.toFixed(5)} ← centro`);
+
+  // currentPrice para o contrato (só tracking — uint256 em USD * 1e18)
+  const currentPriceRaw = BigInt(Math.round(polPriceUSD * 1e18));
+
+  // ── Setar slippage = 0 para evitar o "Price slippage check" ──────────────
+  // Necessário porque a posição está 98.58% WMATIC, 1.42% USDC.
+  // Ao rebalancear para 50/50, o amount1Min (USDC) com slippage 1%
+  // fica maior que o USDC que a Uniswap consegue alocar, causando revert.
+  // Slippage 0 significa min0=0 e min1=0 → aceita qualquer proporção.
+  const currentSlip = await contract.slippageBps();
+  console.log(`\n⚙️  Slippage atual: ${currentSlip} bps`);
+
+  if (currentSlip !== 0n) {
+    console.log("   Zerando slippage temporariamente...");
+    const tx0 = await contract.setSlippageBps(0, {
+      gasLimit: 100_000n,
+    });
+    await tx0.wait();
+    console.log("   ✅ slippageBps = 0");
   }
 
-  const currentPrice = BigInt(Math.round(currentPriceUSD * 1e18));
+  // ── Estimar gas ───────────────────────────────────────────────────────────
+  const feeData  = await provider.getFeeData();
+  const gasPrice = feeData.gasPrice!;
+  console.log(`\n   Gas price: ${ethers.formatUnits(gasPrice, "gwei")} gwei`);
 
-  // ── Passo 2: rebalance ────────────────────────────────────────────────────
-  console.log("\n💰 Estimando gas...");
-  let gasEst: bigint;
+  let gasLimit = 1_500_000n;
   try {
-    gasEst = await contract.rebalance.estimateGas(tickLower, tickUpper, currentPrice);
+    const est = await contract.rebalance.estimateGas(tickLower, tickUpper, currentPriceRaw);
+    gasLimit  = est * 130n / 100n;
+    console.log(`   Gas estimado: ${est.toLocaleString()} (limit: ${gasLimit.toLocaleString()})`);
   } catch (e: any) {
-    console.error("❌ estimateGas falhou:", e.shortMessage || e.message);
-    console.log("   Restaurando slippage para 100bps...");
-    await contract.setSlippageBps(100, { gasLimit: 80_000 }).then((t: any) => t.wait());
-    process.exit(1);
+    console.log(`   ⚠️  estimateGas falhou (${e.shortMessage ?? e.message.slice(0, 60)})`);
+    console.log(`   Usando gasLimit manual: ${gasLimit.toLocaleString()}`);
   }
 
-  const feeData = await provider.getFeeData();
-  const custo   = gasEst * (feeData.gasPrice ?? 100_000_000_000n);
-  console.log("   Gas:", gasEst.toString());
-  console.log("   Custo:", ethers.formatEther(custo), "POL");
+  // ── Rebalance ─────────────────────────────────────────────────────────────
+  console.log("\n🔄 Enviando rebalance()...");
+  const tx = await contract.rebalance(
+    tickLower,
+    tickUpper,
+    currentPriceRaw,
+    { gasPrice, gasLimit }
+  );
 
-  console.log("\n🔄 Enviando rebalance...");
-  const tx = await contract.rebalance(tickLower, tickUpper, currentPrice, {
-    gasLimit: gasEst * 120n / 100n,
-  });
+  console.log(`   Tx: ${tx.hash}`);
+  console.log(`   🔗 https://polygonscan.com/tx/${tx.hash}`);
 
-  console.log("   TX:", tx.hash);
   const receipt = await tx.wait();
 
-  if (receipt.status === 0) {
-    console.error("❌ Reverteu:", `https://polygonscan.com/tx/${tx.hash}`);
-    await contract.setSlippageBps(100, { gasLimit: 80_000 }).then((t: any) => t.wait());
+  if (receipt.status !== 1) {
+    console.error("❌ Rebalance falhou. Veja o PolygonScan.");
+    // Restaurar slippage mesmo em caso de erro
+    await contract.setSlippageBps(100, { gasLimit: 100_000n });
     process.exit(1);
   }
 
-  // ── Passo 3: restaurar slippage ───────────────────────────────────────────
-  console.log("\n⚙️  Restaurando slippage para 100bps...");
-  await contract.setSlippageBps(100, { gasLimit: 80_000 }).then((t: any) => t.wait());
-  console.log("   ✅ Slippage restaurado");
+  console.log(`   ✅ Rebalance OK | bloco: ${receipt.blockNumber} | gas: ${receipt.gasUsed.toLocaleString()}`);
 
-  console.log("\n✅ Sucesso! Gas usado:", receipt.gasUsed.toString());
-  console.log("🎯 Posição IN RANGE: $" + priceFromTick(tickLower).toFixed(4) + " – $" + priceFromTick(tickUpper).toFixed(4));
-  console.log("   Preço atual ($" + currentPriceUSD.toFixed(4) + ") dentro do range");
-  console.log("   https://revert.finance/#/account/0xde95b32d6b0ff10c5bcec9e13f41aca94d352e67/polygon");
+  // ── Restaurar slippage = 100 (1%) ─────────────────────────────────────────
+  console.log("\n⚙️  Restaurando slippage para 100 bps (1%)...");
+  const txR = await contract.setSlippageBps(100, { gasLimit: 100_000n });
+  await txR.wait();
+  console.log("   ✅ slippageBps = 100");
+
+  // ── Resultado final ───────────────────────────────────────────────────────
+  console.log(`\n${"━".repeat(52)}`);
+  console.log("✅ RANGE RECENTRADO");
+  console.log(`${"━".repeat(52)}`);
+  console.log(`   Preço atual: $${polPriceUSD.toFixed(5)}`);
+  console.log(`   Range:       $${priceLowerUSD.toFixed(5)} – $${priceUpperUSD.toFixed(5)}`);
+  console.log(`   Ticks:       [${tickLower}, ${tickUpper}]`);
+  console.log(`   Revert:      https://revert.finance/#/account/${wallet.address}/polygon`);
+  console.log(`${"━".repeat(52)}\n`);
 }
 
-main().catch(console.error);
+main().catch(e => {
+  console.error("\n❌", e.shortMessage ?? e.message ?? e);
+  process.exit(1);
+});
